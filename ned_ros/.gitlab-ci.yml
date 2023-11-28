@@ -1,0 +1,388 @@
+image: gitlab01.niryotech.com:5050/robot/ned/ned-ros-stack/ned_ros_stack:amd64
+
+variables:
+  ROS_LANG_DISABLE: genlisp:geneus:gennodejs
+
+  ########### Part that needs to be overwrite for each documentation ###########
+
+  # Documentation name
+  DOCUMENTATION_NAME: ros
+
+  DOCUMENTATION_OUTPUT_FOLDER: "output_build"
+
+  BASE_GITLAB_CI_RESSOURCE_URL: "https://gitlab01.niryotech.com/pipelines/gitlab-ci-jobs/-/raw/master/"
+
+  GITLAB_CATKIN_PROFILE_NAME: gitlab_ci
+
+  ##############################################################################
+
+  # Allow to pull the directory containing front-end files
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_STRATEGY: fetch
+  GIT_DEPTH: 0
+  NIRYO_HOME_FOLDER: /home/niryo/catkin_ws
+  GET_SOURCES_ATTEMPTS: 3
+
+stages:
+  - build_docker
+  - build
+  - documentation
+  - build_tests
+  - test
+  - upload
+  - environment_test
+  - release_gitlab
+
+include:
+  ## See https://docs.gitlab.com/ee/user/project/merge_requests/code_quality.html
+  - template: Code-Quality.gitlab-ci.yml
+  # Build documentation
+  - project: 'pipelines/gitlab-ci-jobs'
+    ref: master
+    file: 'documentation/build_documentation/build_documentation_config.yml'
+  # Check for missing translations or fuzzy
+  - project: 'pipelines/gitlab-ci-jobs'
+    ref: master
+    file: 'documentation/missing_translations/missing_translations_config.yml'
+  # Upload documentation to niryo.com ftp
+  - project: 'pipelines/gitlab-ci-jobs'
+    ref: master
+    file: 'documentation/upload_to_ftp/upload_to_ftp_config.yml'
+  # Check for broken links in website
+  - project: 'pipelines/gitlab-ci-jobs'
+    ref: master
+    file: 'documentation/link_checker/link_checker_config.yml'
+  # Create Gitlab release (tag + release)
+  - project: 'pipelines/gitlab-ci-jobs'
+    ref: master
+    file: 'various/release_gitlab/release_gitlab_config.yml'
+
+
+.build_docker_job:
+  image:
+    name: gcr.io/kaniko-project/executor:v1.9.0-debug
+    entrypoint: [ "" ]
+  stage: build_docker
+  script:
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/.docker/Dockerfile"
+      --customPlatform "${CUSTOMPLATFORM}"
+      --destination "${CI_REGISTRY_IMAGE}/ned_ros_stack:${TAG}"
+  only:
+    changes:
+      - .docker/Dockerfile
+
+build_docker_amd64_job:
+  extends: .build_docker_job
+  variables:
+    CUSTOMPLATFORM: linux/amd64
+    TAG: "amd64"
+
+build_docker_arm64_job:
+  extends: .build_docker_job
+  variables:
+    CUSTOMPLATFORM: linux/arm64
+    TAG: "arm64"
+
+.abstract_catkin_build:
+  stage: build
+  retry:
+    max: 1
+  script:
+    # Create whole path folders
+    - mkdir -p ${NIRYO_HOME_FOLDER}/src
+    # moving everything in src folder
+    - shopt -s extglob dotglob # Allow to use regex and move all files including ".XXXX" looking files
+    - mv !(src) ${NIRYO_HOME_FOLDER}/src/
+    ######################################
+    - cd ${NIRYO_HOME_FOLDER}
+    - cp -r src/.gitlab_resources/.catkin_tools .
+    # we need to first build the packages before building tests
+    - catkin build --profile ${CATKIN_PROFILE_NAME} -j1
+    - cd -
+    - mv ${NIRYO_HOME_FOLDER}/* .
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - devel
+      - build
+      - install
+
+catkin_make_amd:
+  extends: .abstract_catkin_build
+  variables:
+    CATKIN_PROFILE_NAME: ${GITLAB_CATKIN_PROFILE_NAME}
+
+build_arm_niryo_one:
+  image: gitlab01.niryotech.com:5050/robot/ned/ned-ros-stack/ned_ros_stack:arm64
+  extends: .abstract_catkin_build
+  variables:
+    CATKIN_PROFILE_NAME: release_one
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+
+build_arm_ned:
+  image: gitlab01.niryotech.com:5050/robot/ned/ned-ros-stack/ned_ros_stack:arm64
+  extends: .abstract_catkin_build
+  variables:
+    CATKIN_PROFILE_NAME: release_ned
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+
+build_arm_ned2:
+  image: gitlab01.niryotech.com:5050/robot/ned/ned-ros-stack/ned_ros_stack:arm64
+  extends: .abstract_catkin_build
+  variables:
+    CATKIN_PROFILE_NAME: release_ned2
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+
+build_doc_job:
+  image: gitlab01.niryotech.com:5050/documentations/build_docs/ned_ros_stack:latest_amd64
+  dependencies:
+    - catkin_make_amd
+  stage: documentation
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    - cd src/sphinx_doc
+    # Build documentation without todo printing in final document
+    - scripts/build_docs.sh -D todo_include_todos=0 -o ${DOCUMENTATION_OUTPUT_FOLDER}
+    - scripts/generate_pdf.sh -o ${DOCUMENTATION_OUTPUT_FOLDER}/generated_pdfs
+    - mv ${NIRYO_HOME_FOLDER}/* ${previous_path}
+  after_script:
+    - mv src/sphinx_doc/${DOCUMENTATION_OUTPUT_FOLDER} ${DOCUMENTATION_OUTPUT_FOLDER}
+
+.abstract_move_source_tricks_job:
+  stage: test
+  dependencies:
+    - catkin_make_amd
+  script:
+    # Quick fix for changing "ROS folder "
+    - previous_path=`pwd`
+    - mkdir -p ${NIRYO_HOME_FOLDER}
+    - cd ${NIRYO_HOME_FOLDER}
+    - mkdir src
+    - shopt -s dotglob
+    - mv ${CI_PROJECT_DIR}/* src
+    - mv src/install .
+    - mv src/build .
+    - mv src/devel .
+    - ls -al .
+    - cp -r src/.gitlab_resources/.catkin_tools .
+    ################# Quickfix end ###############
+    - source install/${GITLAB_CATKIN_PROFILE_NAME}/setup.bash
+  # Important to restore to proper artifacts folder (pwd gets resetted between script/after_script)
+  after_script:
+    - mv ${NIRYO_HOME_FOLDER}/* .
+
+catkin_compile_tests:
+  stage: build_tests
+  dependencies:
+    - catkin_make_amd
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    - catkin build --profile ${GITLAB_CATKIN_PROFILE_NAME} --make-args tests
+  # Important to restore to proper artifacts folder (pwd gets resetted between script/after_script)
+  after_script:
+    - mv ${NIRYO_HOME_FOLDER}/* .
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - devel
+      - build
+      - install
+  retry:
+    max: 1
+
+test_job:
+  stage: test
+  dependencies:
+    - catkin_compile_tests
+  artifacts:
+    expire_in: 1 week
+    when: always
+    paths:
+      - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/rostest-*.xml
+      - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/gtest-*.xml
+      - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/rosunit-*.xml
+    reports:
+      junit:
+        - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/rostest-*.xml
+        - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/gtest-*.xml
+        - build/${GITLAB_CATKIN_PROFILE_NAME}/*/test_results/*/rosunit-*.xml
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    - catkin build --profile ${GITLAB_CATKIN_PROFILE_NAME} -j1
+    # Launch all tests (python / C++)
+    # Note: Without -j1, multiple jobs was running and problems occured for xml results output files
+    # (sometimes a part of file was duplicated and unreadable by scripts then)
+    - catkin run_tests --profile ${GITLAB_CATKIN_PROFILE_NAME} -j1
+  after_script:
+    - mv ${NIRYO_HOME_FOLDER}/* .
+  allow_failure: true
+  when: manual
+
+roslint_job:
+  stage: test
+  dependencies:
+    - catkin_make_amd
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    # Check code linting
+    - catkin build --profile ${GITLAB_CATKIN_PROFILE_NAME} --make-args roslint -j1
+
+catkin_lint_job:
+  stage: test
+  dependencies:
+    - catkin_make_amd
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    # Check code linting
+    - catkin_lint -W2 --rosdistro noetic --ignore missing_directory --ignore unknown_package --explain src
+
+code_coverage_cpp_job:
+  stage: test
+  dependencies:
+    - catkin_compile_tests
+  variables:
+    BUILD_CODE_COVERAGE_SCRIPT_PATH: development-tools/Code_Analysis/build_code_coverage.sh
+    GENERATE_CODE_COVERAGE_SCRIPT_PATH: development-tools/Code_Analysis/gen_report_code_coverage.sh
+    COBERTURA_OUTPUT_FILENAME: cobertura.xml
+  script:
+    # Do stuff to move source properly for catkin_make
+    - !reference [ .abstract_move_source_tricks_job, script ]
+    # Build and generate reports
+    - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab01.niryotech.com/robot/common/development-tools.git
+    - ./${BUILD_CODE_COVERAGE_SCRIPT_PATH} -p ${GITLAB_CATKIN_PROFILE_NAME}
+    - ./${GENERATE_CODE_COVERAGE_SCRIPT_PATH} -s false -p build
+    # Retrieve codecov software and upload code coverage to codecov.io
+    - cd src
+    - curl -Os https://uploader.codecov.io/latest/linux/codecov
+    - chmod +x codecov
+    - ./codecov -t ${CODECOV_TOKEN} -s ../build/${GITLAB_CATKIN_PROFILE_NAME} -C ${CI_COMMIT_SHA} -B ${CI_COMMIT_REF_NAME}
+    # Generate parsable files by gitlab
+    - cd ..
+    - ./src/.gitlab_resources/create_code_coverage_for_gitlab.sh -p "./build" -o ${COBERTURA_OUTPUT_FILENAME}
+  after_script:
+    - mv ${NIRYO_HOME_FOLDER}/* .
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - build/report
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: ${COBERTURA_OUTPUT_FILENAME}
+  # URL: https://docs.gitlab.com/ee/ci/yaml/#coverage
+  coverage: '/lines\.+: (\d+.\d+\%)/'
+
+
+code_quality:
+  tags:
+    - dind
+  artifacts:
+    expire_in: 1 week
+    paths: [ gl-code-quality-report.json ]
+  # Authenticate with account to not be limited by docker hub pull rate limit
+  before_script:
+    - docker login -u ${DOCKER_HUB_DOCKER_ID} -p ${DOCKER_HUB_PASSWORD}
+
+code_quality_html:
+  extends: code_quality
+  variables:
+    REPORT_FORMAT: html
+  artifacts:
+    expire_in: 1 week
+    paths: [ gl-code-quality-report.html ]
+
+missing_translation_job:
+  image: gitlab01.niryotech.com:5050/documentations/build_docs/base:latest_amd64
+  stage: test
+  variables:
+    LOCALE_FOLDER_PATH: ./sphinx_doc/locale
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+.staging_job:
+  variables: &staging_variables
+    DOMAIN_NAME: https://staging.docs.niryo.com
+    BASE_FOLDER_DOC_URL: https://staging.docs.niryo.com/dev
+    TARGET_FOLDER_OVH: ~/docs_staging/dev
+
+upload_staging_job:
+  image: gitlab01.niryotech.com:5050/documentations/build_docs/base:latest_amd64
+  stage: upload
+  environment:
+    name: staging
+    deployment_tier: staging
+    action: start
+  tags:
+    - staging
+  variables:
+    CI_COMMIT_TAG: v0.0.1
+    <<: *staging_variables
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+  extends: .abstract_upload
+
+linkchecker_staging_job:
+  extends: .abstract_linkchecker
+  stage: environment_test
+  variables:
+    <<: *staging_variables
+  rules:
+    - if: $CI_COMMIT_BRANCH
+  needs:
+    - upload_staging_job
+
+.production_job:
+  variables: &production_variables
+    DOMAIN_NAME: https://docs.niryo.com
+    BASE_FOLDER_DOC_URL: https://docs.niryo.com/dev
+    TARGET_FOLDER_OVH: ~/docs/dev
+  rules: &production_rules
+    ## Just in case we would restrict to master (https://stackoverflow.com/a/64448994)
+    # If a it's a tag && protected tag
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_REF_PROTECTED == "true"
+
+upload_production_job:
+  image: gitlab01.niryotech.com:5050/documentations/build_docs/base:latest_amd64
+  rules: *production_rules
+  stage: upload
+  environment:
+    name: production
+    deployment_tier: production
+    action: start
+  tags:
+    - production
+  variables:
+    <<: *production_variables
+  extends: .abstract_upload
+
+linkchecker_production_job:
+  rules: *production_rules
+  stage: environment_test
+  variables:
+    <<: *production_variables
+  needs:
+    - upload_production_job
+  extends: .abstract_linkchecker
+
+release_gitlab_job:
+  rules: *production_rules
+  stage: release_gitlab

@@ -1,0 +1,58 @@
+<?xml version="1.0" ?>
+<!-- This launch file allows to run simulation on Gazebo
+Warning : Some errors are present in Gazebo
+-> It will log some errors because it cannot unload joint_controller (It's because ROS does it before Gazebo)
+-> Gazebo GUI is kinda bad on closing. It will always run into SIGTERM. So, what you should do is
+to change _TIMEOUT_SIGINT value in the file /opt/ros/noetic/lib/python2.7/dist-packages/roslaunch/nodeprocess.py
+This will reduce the amount of time spent waiting during program shutdown
+-->
+<launch xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="https://gist.githubusercontent.com/nalt/dfa2abc9d2e3ae4feb82ca5608090387/raw/roslaunch.xsd">
+    <env name="ROSCONSOLE_CONFIG_FILE"
+        value="$(find niryo_robot_bringup)/config/desktop_gazebo_simulation_trace.conf" />
+    <!-- Arguments definition -->
+    <arg name="log_level" default="INFO" />
+    <arg name="hardware_version" default="ned" />
+    <arg name="debug" default="false"/>
+    <arg name="gripper_n_camera" default="true"/>
+    <arg name="simu_conveyor" default="true"/>
+    <arg name="gui" default="true"/>
+    <arg name="conf_location" default="version.txt"/>
+    <arg name="model" default="burger"/>
+    <arg name="x_pos" default="0.0"/>
+    <arg name="y_pos" default="0.0"/>
+    <arg name="z_pos" default="0.0"/>
+    <arg name="joints_gui" default="true"/>
+    <!-- Define most of ROS parameters -->
+    <include file="$(find niryo_robot_bringup)/launch/niryo_$(arg hardware_version)_simulation.launch">
+        <arg name="simu_gripper" value="$(arg gripper_n_camera)"/>
+        <arg name="simu_conveyor" value="$(arg simu_conveyor)"/>
+        <arg name="log_level" value="$(arg log_level)" />
+        <arg name="debug" value="$(arg debug)"/>
+        <arg name="gazebo" value="true" />
+    </include>
+
+    <!-- Launching Gazebo World -->
+    <include file="$(find niryo_robot_gazebo)/launch/niryo_robot_gazebo_world.launch.xml">
+        <arg name="gui" value="$(arg gui)"/>
+    </include>
+
+    <param name="/niryo_robot_vision/initialized" type="bool" value="true" unless="$(arg gripper_n_camera)"/>
+
+        <!-- BEGIN ROBOT 1-->
+    <group ns="turtlebot3">
+        <param name="robot_description"
+        command="$(find xacro)/xacro --inorder $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro"/>
+        <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param robot_description -model $(arg model) -x 0.5 -y 0.5 -z 0"
+        respawn="false" output="screen" />
+        <node if="$(eval arg('joints_gui'))" name="joint_state_publisher_gui" pkg="joint_state_publisher_gui" type="joint_state_publisher_gui"/>
+        <node unless="$(eval arg('joints_gui'))" name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher"/>
+        <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+        <!-- <include file="$(find tur_niryo_manipulator)/launch/one_robot.launch" >
+        <arg name="init_pose" value="-x 1 -y 1 -z 0" />
+        <arg name="robot_name"  value="turtlebot3" />
+        </include> -->
+    </group>
+
+</launch>
